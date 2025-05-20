@@ -1,103 +1,126 @@
-import streamlit as st
 import pandas as pd
-from pymongo import MongoClient
-from transformers import pipeline
-from langchain.llms import HuggingFacePipeline
-from langchain.prompts import PromptTemplate
-from langchain.chains import LLMChain
-import os
-import json
+import mysql.connector
 from datetime import datetime
 
-# === MongoDB Config ===
-MONGO_URI = "mongodb://localhost:27017"
-DB_NAME = "gen_ai_db"
-COLLECTION_NAME = "products"
+CSV_FILE = "sample_data.csv"
+DB_CONFIG = {
+    "host": "localhost",
+    "user": "root",
+    "password": "root",
+    "database": "product_db"
+}
+TABLE_NAME = "products"
 
-# === Set up local LLM (using small model for demo) ===
-@st.cache_resource
-def setup_local_llm():
-    pipe = pipeline("text-generation", model="tiiuae/falcon-rw-1b", max_new_tokens=150)
-    llm = HuggingFacePipeline(pipeline=pipe)
-    return llm
+def load_csv_to_mysql():
+    # Load the CSV
+    df = pd.read_csv(CSV_FILE)
+    
+    # Strip spaces from column names
+    df.columns = df.columns.str.strip()
 
-# === Load CSV to MongoDB ===
-def load_csv_to_mongodb(csv_file):
-    df = pd.read_csv(csv_file)
-    client = MongoClient(MONGO_URI)
-    db = client[DB_NAME]
-    collection = db[COLLECTION_NAME]
-    collection.delete_many({})
-    collection.insert_many(df.to_dict(orient="records"))
-    return df.columns.tolist()
+    # Debug print to check column names
+    print("Detected CSV Columns:", df.columns.tolist())
 
-# === Generate Query using LLM ===
-def generate_query(llm, user_question):
-    template = """
-You are a MongoDB expert. Convert the following question into a valid MongoDB query using the 'products' collection.
-Question: {question}
-MongoDB Query:
-"""
-    prompt = PromptTemplate(input_variables=["question"], template=template)
-    chain = LLMChain(llm=llm, prompt=prompt)
-    return chain.run(user_question).strip()
+    # Required columns
+    required_cols = ['ProductID', 'Name', 'Category', 'Rating', 'Reviews',
+                     'Brand', 'Stock', 'LaunchDate', 'Discount', 'Price']
+    missing_cols = [col for col in required_cols if col not in df.columns]
 
-# === Execute MongoDB Query ===
-def execute_query(query_string):
-    client = MongoClient(MONGO_URI)
-    db = client[DB_NAME]
-    collection = db[COLLECTION_NAME]
-    try:
-        query_dict = eval(query_string.split("find(")[1].rstrip(")"))
-        results = list(collection.find(query_dict))
-        return results
-    except Exception as e:
-        st.error(f"Query execution failed: {e}")
-        return []
+    if missing_cols:
+        print(f"Missing columns in CSV: {missing_cols}")
+        return
 
-# === Save result CSV ===
-def save_result_csv(data):
-    if not data:
-        return None
-    df = pd.DataFrame(data)
-    filename = f"result_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    df.to_csv(filename, index=False)
-    return filename
+    # Connect to MySQL and create table if not exists
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cursor = conn.cursor()
 
-# === UI ===
-st.title("🧠 Gen-AI Data Query System with MongoDB + LLM")
+    cursor.execute(f'''
+    CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+        ProductID INT PRIMARY KEY,
+        Name VARCHAR(100),
+        Category VARCHAR(100),
+        Rating FLOAT,
+        Reviews INT,
+        Brand VARCHAR(50),
+        Stock INT,
+        LaunchDate DATE,
+        Discount FLOAT,
+        Price FLOAT
+    )
+    ''')
 
-uploaded_file = st.file_uploader("Upload a CSV file", type="csv")
+    # Insert rows
+    for _, row in df.iterrows():
+        try:
+            sql = f'''
+            INSERT IGNORE INTO {TABLE_NAME} 
+            (ProductID, Name, Category, Rating, Reviews, Brand, Stock, LaunchDate, Discount, Price)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            '''
 
-if uploaded_file:
-    columns = load_csv_to_mongodb(uploaded_file)
-    st.success("CSV loaded to MongoDB!")
+            launch_date = row['LaunchDate']
+            if isinstance(launch_date, str):
+                try:
+                    launch_date = datetime.strptime(launch_date, "%Y-%m-%d").date()
+                except:
+                    launch_date = None
 
-    question = st.text_area("🔍 Ask a question about your data:", height=100)
+            cursor.execute(sql, (
+                int(row['ProductID']),
+                row['Name'],
+                row['Category'],
+                float(row['Rating']),
+                int(row['Reviews']),
+                row['Brand'],
+                int(row['Stock']),
+                launch_date,
+                float(row['Discount']),
+                float(row['Price'])
+            ))
+        except Exception as e:
+            print(f"Skipping row due to error: {e}")
 
-    if st.button("Generate & Run Query"):
-        with st.spinner("Loading local LLM..."):
-            llm = setup_local_llm()
+    conn.commit()
+    cursor.close()
+    conn.close()
+    print("✅ Data successfully loaded into MySQL!")
 
-        with st.spinner("Generating MongoDB query..."):
-            query = generate_query(llm, question)
-            st.code(query, language="json")
+def get_sql_queries():
+    return {
+        1: """SELECT * FROM products 
+              WHERE Rating < 4.5 AND Reviews > 200 
+              AND Brand IN ('Nike', 'Sony')""",
 
-            # Save query
-            with open("Queries_generated.txt", "a") as f:
-                f.write(f"Question: {question}\nQuery: {query}\n\n")
+        2: """SELECT * FROM products 
+              WHERE Category = 'Electronics' 
+              AND Rating >= 4.5 
+              AND Stock > 0""",
 
-        with st.spinner("Running query and retrieving results..."):
-            result = execute_query(query)
+        3: """SELECT * FROM products 
+              WHERE LaunchDate > '2022-01-01' 
+              AND Category IN ('Home & Kitchen', 'Sports') 
+              AND Discount >= 10 
+              ORDER BY Price DESC"""
+    }
 
-        if result:
-            st.success("✅ Query executed. Preview below:")
-            df = pd.DataFrame(result).drop(columns=['_id'], errors='ignore')
-            st.dataframe(df)
+def run_queries_and_save():
+    queries = get_sql_queries()
+    conn = mysql.connector.connect(**DB_CONFIG)
 
-            filename = save_result_csv(result)
-            if filename:
-                with open(filename, "rb") as f:
-                    st.download_button("⬇️ Download CSV", f, file_name=filename)
-        else:
-            st.warning("No results found or query failed.")
+    for test_case, query in queries.items():
+        df = pd.read_sql(query, conn)
+        df.to_csv(f"test_case{test_case}.csv", index=False)
+
+    conn.close()
+
+    with open("Queries_generated.txt", "w") as f:
+        for test_case, query in queries.items():
+            f.write(f"Test Case {test_case}:\n{query}\n\n")
+    print("✅ SQL queries executed and output saved.")
+
+def main():
+    load_csv_to_mysql()
+    run_queries_and_save()
+
+if __name__ == "__main__":
+    main()
